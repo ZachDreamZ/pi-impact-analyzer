@@ -152,11 +152,15 @@ export class GraphBuilder {
 		exportedSymbols: SymbolDefinition[],
 	): void {
 		for (const importSymbol of importStmt.symbols) {
-			const matchingExport = this.findMatchingExport(exportedSymbols, importSymbol.name);
+			const matchingExport = this.findMatchingExport(
+				exportedSymbols,
+				importSymbol.name,
+			);
 			if (!matchingExport) continue;
 
 			const fromId = this.createNodeId(matchingExport);
-			const importedNodeIds = this.graph.symbolIndex.get(importSymbol.name) || [];
+			const importedNodeIds =
+				this.graph.symbolIndex.get(importSymbol.name) || [];
 
 			for (const toId of importedNodeIds) {
 				if (fromId !== toId) {

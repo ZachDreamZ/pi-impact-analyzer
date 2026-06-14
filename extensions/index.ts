@@ -217,12 +217,11 @@ export type {
 } from "./types";
 
 /**
- * Pi extension registration function.
+ * Pi extension factory function.
+ * This is the default export that Pi calls to initialize the extension.
  */
-export function register(context: any): void {
+export default function piImpactAnalyzer(pi: any): void {
 	// Register the impact_analyze tool
-	if (context && typeof context.registerTool === "function") {
-		context.registerTool("impact_analyze", impactAnalyzeHandler);
-		console.log("[pi-impact-analyzer] Registered impact_analyze tool");
-	}
+	pi.registerTool("impact_analyze", impactAnalyzeHandler);
+	console.log("[pi-impact-analyzer] Registered impact_analyze tool");
 }

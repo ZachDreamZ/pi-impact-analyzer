@@ -1,10 +1,13 @@
-import type { Node } from "web-tree-sitter";
 import type {
 	SymbolDefinition,
 	CallSite,
 	ImportStatement,
 	ExportStatement,
 } from "./types";
+
+// Alias SyntaxNode as Node for readability in extraction logic
+import type { SyntaxNode } from "web-tree-sitter";
+type Node = SyntaxNode;
 
 /**
  * Extracts symbols, call sites, imports, and exports from an AST.
@@ -27,17 +30,12 @@ export class ASTExtractor {
 	/**
 	 * Extract all call sites from the AST.
 	 */
-	public extractCallSites(
-		rootNode: Node,
-		filePath: string,
-		symbols: SymbolDefinition[],
-	): CallSite[] {
+	public extractCallSites(rootNode: Node, filePath: string): CallSite[] {
 		const callSites: CallSite[] = [];
-		const symbolNames = new Set(symbols.map((s) => s.name));
 
 		this.walkNode(rootNode, (node) => {
 			if (node.type === "call_expression") {
-				const callSite = this.extractCallSite(node, filePath, symbolNames);
+				const callSite = this.extractCallSite(node, filePath);
 				if (callSite) {
 					callSites.push(callSite);
 				}
@@ -99,6 +97,16 @@ export class ASTExtractor {
 		node: Node,
 		filePath: string,
 	): SymbolDefinition | null {
+		// Skip arrow_function/function when parent is a variable_declarator.
+		// The variable_declarator itself will be captured as a "variable" type,
+		// preventing duplicate symbols for `const foo = () => {}` (H2 fix).
+		if (
+			(node.type === "arrow_function" || node.type === "function") &&
+			node.parent?.type === "variable_declarator"
+		) {
+			return null;
+		}
+
 		const mapping: Record<string, SymbolDefinition["type"]> = {
 			function_declaration: "function",
 			function: "function",
@@ -126,6 +134,8 @@ export class ASTExtractor {
 			file: filePath,
 			line: node.startPosition.row,
 			column: node.startPosition.column,
+			endLine: node.endPosition.row,
+			endColumn: node.endPosition.column,
 			startIndex: node.startIndex,
 			endIndex: node.endIndex,
 			isExported,
@@ -134,7 +144,7 @@ export class ASTExtractor {
 
 	private getNodeName(node: Node): string | null {
 		// Try to get name from child with field name "name"
-		const nameNode = node.childByFieldName("name");
+		const nameNode = node.childForFieldName("name");
 		if (nameNode) {
 			return nameNode.text;
 		}
@@ -164,16 +174,32 @@ export class ASTExtractor {
 		const parent = node.parent;
 		if (!parent) return false;
 
-		return (
-			parent.type === "export_statement" || parent.type === "export_declaration"
-		);
+		// Check if the direct parent is an export statement (handles function, class, interface)
+		if (
+			parent.type === "export_statement" ||
+			parent.type === "export_declaration"
+		) {
+			return true;
+		}
+
+		// For const/let/var: parent chain is variable_declarator → variable_declaration/lexical_declaration → export_statement
+		// Walk up to the grandparent to check for export
+		if (
+			node.type === "variable_declarator" &&
+			(parent.type === "variable_declaration" ||
+				parent.type === "lexical_declaration")
+		) {
+			const grandparent = parent.parent;
+			return (
+				grandparent?.type === "export_statement" ||
+				grandparent?.type === "export_declaration"
+			);
+		}
+
+		return false;
 	}
 
-	private extractCallSite(
-		node: Node,
-		filePath: string,
-		_knownSymbols: Set<string>,
-	): CallSite | null {
+	private extractCallSite(node: Node, filePath: string): CallSite | null {
 		// Get the function being called
 		const functionNode = node.namedChildren[0];
 		if (!functionNode) return null;
@@ -186,7 +212,7 @@ export class ASTExtractor {
 		}
 		// Method call: obj.method()
 		else if (functionNode.type === "member_expression") {
-			const property = functionNode.childByFieldName("property");
+			const property = functionNode.childForFieldName("property");
 			if (property) {
 				calleeName = property.text;
 			}
@@ -241,9 +267,11 @@ export class ASTExtractor {
 
 	private getImportSource(node: Node): string | null {
 		// Find the string literal for the import source
+		// The string child is NOT field-named in the TypeScript grammar
 		for (const child of node.namedChildren) {
 			if (child.type === "string") {
-				// Remove quotes
+				// Remove quotes — guard against empty strings
+				if (child.text.length < 2) return null;
 				return child.text.slice(1, -1);
 			}
 		}
@@ -253,91 +281,71 @@ export class ASTExtractor {
 	private getImportSymbols(node: Node): ImportStatement["symbols"] {
 		const symbols: ImportStatement["symbols"] = [];
 
-		// import * as foo from 'bar'
-		const namespaceImport = node.childByFieldName("namespace_import");
-		if (namespaceImport) {
-			const identifier = namespaceImport.namedChildren[0];
-			if (identifier) {
+		// Find the import_clause child (TypeScript grammar doesn't use field names for imports)
+		const importClause = node.namedChildren.find(
+			(c) => c.type === "import_clause",
+		);
+		if (!importClause) return symbols;
+
+		for (const child of importClause.namedChildren) {
+			if (child.type === "namespace_import") {
+				// import * as foo from 'bar' — or foo, * as bar from 'baz'
+				const identifier = child.namedChildren[0];
+				if (identifier) {
+					symbols.push({
+						name: identifier.text,
+						isType: false,
+					});
+				}
+			} else if (child.type === "named_imports") {
+				// import { Foo, Bar as Baz } from 'qux'
+				for (const spec of child.namedChildren) {
+					if (spec.type === "import_specifier") {
+						const name = spec.namedChildren.find(
+							(c) => c.type === "identifier",
+						);
+						const alias = spec.namedChildren[1];
+						if (name) {
+							symbols.push({
+								name: name.text,
+								alias: alias?.type === "identifier" ? alias.text : undefined,
+								isType: false,
+							});
+						}
+					}
+				}
+			} else if (child.type === "identifier") {
+				// import Default from 'bar'
 				symbols.push({
-					name: identifier.text,
+					name: child.text,
 					isType: false,
 				});
 			}
-			return symbols;
-		}
-
-		// import { foo, bar as baz } from 'qux'
-		const importClause = node.childByFieldName("import_clause");
-		if (importClause) {
-			this.extractImportIdentifiers(importClause, symbols, false);
-		}
-
-		// import foo from 'bar' (default import)
-		const defaultImport = node.namedChildren[0];
-		if (defaultImport?.type === "identifier") {
-			symbols.push({
-				name: defaultImport.text,
-				isType: false,
-			});
 		}
 
 		return symbols;
 	}
 
-	private extractImportIdentifiers(
-		node: Node,
-		symbols: ImportStatement["symbols"],
-		isType: boolean,
-	): void {
-		for (const child of node.namedChildren) {
-			if (child.type === "identifier") {
-				symbols.push({
-					name: child.text,
-					isType,
-				});
-			} else if (child.type === "import_specifier") {
-				const name = child.childByFieldName("name");
-				const alias = child.childByFieldName("alias");
-				if (name) {
-					symbols.push({
-						name: name.text,
-						alias: alias?.text,
-						isType,
-					});
-				}
-			} else if (child.type === "import_clause") {
-				this.extractImportIdentifiers(child, symbols, isType);
-			}
-		}
-	}
-
 	private extractExport(node: Node, filePath: string): ExportStatement | null {
 		const symbols: ExportStatement["symbols"] = [];
 
-		// Handle default exports
+		// Determine if this is a default export by checking for the 'default' keyword (M4 fix)
+		const isDefaultExport = node.children?.some((c) => c.type === "default");
+
+		// Handle declarations: export function foo() {}, export class Foo {}, export default class Foo {}
 		const declaration = node.namedChildren[0];
-		if (declaration) {
+		if (declaration && declaration.type !== "export_clause") {
 			const name = this.getNodeName(declaration);
 			if (name) {
 				symbols.push({
 					name,
-					isDefault: false,
+					isDefault: isDefaultExport,
 				});
 			}
 		}
 
-		// Handle named exports
-		for (const child of node.namedChildren) {
-			if (child.type === "export_specifier") {
-				const name = child.childByFieldName("name");
-				if (name) {
-					symbols.push({
-						name: name.text,
-						isDefault: false,
-					});
-				}
-			}
-		}
+		// Collect export specifiers, handling nested export_clause
+		this.collectExportSpecifiers(node, symbols);
 
 		if (symbols.length === 0) return null;
 
@@ -346,5 +354,29 @@ export class ASTExtractor {
 			filePath,
 			line: node.startPosition.row,
 		};
+	}
+
+	/**
+	 * Recursively collect export specifiers from the node tree.
+	 * Handles: export { foo, bar }, export { foo as bar }, and nested export_clause nodes.
+	 */
+	private collectExportSpecifiers(
+		node: Node,
+		symbols: ExportStatement["symbols"],
+	): void {
+		for (const child of node.namedChildren) {
+			if (child.type === "export_specifier") {
+				const nameNode = child.childForFieldName("name");
+				if (nameNode) {
+					symbols.push({
+						name: nameNode.text,
+						isDefault: false,
+					});
+				}
+			} else if (child.type === "export_clause") {
+				// recurse into export_clause to find export_specifiers
+				this.collectExportSpecifiers(child, symbols);
+			}
+		}
 	}
 }

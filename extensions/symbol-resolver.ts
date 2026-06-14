@@ -1,3 +1,4 @@
+import path from "path";
 import type { SymbolDefinition, ImportStatement, FileMetadata } from "./types";
 
 /**
@@ -8,28 +9,6 @@ export interface ResolverConfig {
 	paths?: Record<string, string[]>;
 	rootDir?: string;
 }
-
-/**
- * Simple path utilities (no Node.js dependency)
- */
-const PathUtils = {
-	dirname(filePath: string): string {
-		const lastSlash = Math.max(
-			filePath.lastIndexOf("/"),
-			filePath.lastIndexOf("\\"),
-		);
-		if (lastSlash === -1) return ".";
-		return filePath.substring(0, lastSlash);
-	},
-
-	join(...parts: string[]): string {
-		return parts.join("/").replace(/\/+/g, "/").replace(/\/$/, "") || ".";
-	},
-
-	sep(): string {
-		return "/";
-	},
-};
 
 /**
  * Resolves imports to actual file paths and symbols.
@@ -158,7 +137,7 @@ export class SymbolResolver {
 						"/index.ts",
 						"/index.js",
 					]) {
-						const fullPath = PathUtils.join(
+						const fullPath = path.join(
 							this.config.rootDir || ".",
 							targetPath + ext,
 						);
@@ -174,8 +153,8 @@ export class SymbolResolver {
 	}
 
 	private resolveRelativePath(source: string, fromFile: string): string | null {
-		const fromDir = PathUtils.dirname(fromFile);
-		const resolved = PathUtils.join(fromDir, source);
+		const fromDir = path.dirname(fromFile);
+		const resolved = path.join(fromDir, source);
 
 		for (const ext of [
 			"",
@@ -196,7 +175,7 @@ export class SymbolResolver {
 	}
 
 	private resolveAbsolutePath(source: string): string | null {
-		const basePath = PathUtils.join(this.config.baseUrl || ".", source);
+		const basePath = path.join(this.config.baseUrl || ".", source);
 
 		for (const ext of [
 			"",
@@ -222,17 +201,17 @@ export class SymbolResolver {
 	): number {
 		if (candidate.file === fromFile) return 1.0;
 
-		const candidateDir = PathUtils.dirname(candidate.file);
-		const fromDir = PathUtils.dirname(fromFile);
+		const candidateDir = path.dirname(candidate.file);
+		const fromDir = path.dirname(fromFile);
 
 		if (candidateDir === fromDir) return 0.9;
 
-		const candidateParent = PathUtils.dirname(candidateDir);
-		const fromParent = PathUtils.dirname(fromDir);
+		const candidateParent = path.dirname(candidateDir);
+		const fromParent = path.dirname(fromDir);
 		if (candidateParent === fromParent) return 0.7;
 
-		const candidateDepth = candidateDir.split(PathUtils.sep()).length;
-		const fromDepth = fromDir.split(PathUtils.sep()).length;
+		const candidateDepth = candidateDir.split(path.sep).length;
+		const fromDepth = fromDir.split(path.sep).length;
 		if (Math.abs(candidateDepth - fromDepth) <= 2) return 0.5;
 
 		return 0.3;

@@ -1,12 +1,29 @@
 import type { TreeSitterParser } from "./parser";
+import { setLogger } from "./parser";
 import { ASTExtractor } from "./extractor";
 import { SymbolResolver } from "./symbol-resolver";
+
+// Logger reference — defaults to no-op, shares parser's logging
+// Use parser.setLogger() to configure all pi-impact-analyzer logging at once.
+let log: (...args: unknown[]) => void = () => {};
+
+/**
+ * Override the logger for GraphBuilder.
+ * Also updates the parser module logger so both use the same output.
+ */
+export function setGraphBuilderLogger(
+	logger: (...args: unknown[]) => void,
+): void {
+	log = logger;
+	setLogger(logger);
+}
 import type {
 	CallGraph,
 	GraphNode,
 	FileMetadata,
 	SymbolDefinition,
 	CallSite,
+	ImportStatement,
 } from "./types";
 
 /**
@@ -32,11 +49,18 @@ export class GraphBuilder {
 
 	/**
 	 * Build the graph from a list of files.
+	 * Clears any existing graph first to prevent duplicate nodes.
 	 */
 	public build(files: Array<{ path: string; content: string }>): CallGraph {
-		console.log(
-			`[pi-impact-analyzer] Building graph from ${files.length} files...`,
-		);
+		// Reset graph to prevent duplicate nodes on re-build
+		this.graph = {
+			nodes: new Map(),
+			edges: [],
+			files: new Map(),
+			symbolIndex: new Map(),
+		};
+		this.resolver.clear();
+
 		const startTime = Date.now();
 
 		for (const file of files) {
@@ -48,21 +72,26 @@ export class GraphBuilder {
 		this.calculateRiskScores();
 
 		const duration = Date.now() - startTime;
-		console.log(`[pi-impact-analyzer] Graph built in ${duration}ms`);
-		console.log(`  Nodes: ${this.graph.nodes.size}`);
-		console.log(`  Edges: ${this.graph.edges.length}`);
-		console.log(`  Files: ${this.graph.files.size}`);
+		log(`[pi-impact-analyzer] Graph built in ${duration}ms`);
+		log(`  Nodes: ${this.graph.nodes.size}`);
+		log(`  Edges: ${this.graph.edges.length}`);
+		log(`  Files: ${this.graph.files.size}`);
 
 		return this.graph;
 	}
 
 	/**
-	 * Add a single file to the graph.
+	 * Add a single file to the graph incrementally.
+	 * Only processes imports/call-sites for the new file.
 	 */
 	public addFile(filePath: string, content: string): void {
 		this.indexFile(filePath, content);
-		this.resolveAllImports();
-		this.linkCallSites();
+		// Only resolve imports for the new file
+		const metadata = this.graph.files.get(filePath);
+		if (metadata) {
+			this.processFileImports(filePath, metadata);
+			this.processFileCallSites(filePath, metadata);
+		}
 		this.calculateRiskScores();
 	}
 
@@ -83,15 +112,16 @@ export class GraphBuilder {
 	// ============ Private Methods ============
 
 	private indexFile(filePath: string, content: string): void {
-		const tree = this.parser.parse(content);
+		// Auto-detect language (.ts vs .tsx) and parse with correct grammar
+		const tree = this.parser.parseFile(filePath, content);
+		if (!tree) {
+			log(`[pi-impact-analyzer] Failed to parse ${filePath}`);
+			return;
+		}
 		const rootNode = tree.rootNode;
 
 		const symbols = this.extractor.extractSymbols(rootNode, filePath);
-		const callSites = this.extractor.extractCallSites(
-			rootNode,
-			filePath,
-			symbols,
-		);
+		const callSites = this.extractor.extractCallSites(rootNode, filePath);
 		const imports = this.extractor.extractImports(rootNode, filePath);
 		const exports = this.extractor.extractExports(rootNode, filePath);
 
@@ -143,30 +173,57 @@ export class GraphBuilder {
 			if (!resolvedPath) continue;
 
 			const exportedSymbols = this.resolver.getExportedSymbols(resolvedPath);
-			this.createImportEdges(importStmt, exportedSymbols);
+			this.createImportEdges(importStmt, exportedSymbols, filePath);
 		}
 	}
 
 	private createImportEdges(
 		importStmt: ImportStatement,
 		exportedSymbols: SymbolDefinition[],
+		_importingFilePath: string,
 	): void {
 		for (const importSymbol of importStmt.symbols) {
 			const matchingExport = this.findMatchingExport(
 				exportedSymbols,
 				importSymbol.name,
 			);
-			if (!matchingExport) continue;
+			// If no exact export match, try resolving the symbol name across all indexed files
+			if (!matchingExport) {
+				const resolved = this.resolver.resolveSymbol(
+					importSymbol.name,
+					_importingFilePath,
+				);
+				for (const { symbol: calleeSymbol, confidence } of resolved) {
+					const importNodeIds =
+						this.graph.symbolIndex.get(importSymbol.name) || [];
+					for (const toId of importNodeIds) {
+						const fromId = this.createNodeId(calleeSymbol);
+						if (fromId !== toId) {
+							this.graph.edges.push({
+								from: fromId, // exported symbol node
+								to: toId, // importing symbol node
+								confidence,
+								type: "call",
+							});
+						}
+					}
+				}
+				continue;
+			}
 
 			const fromId = this.createNodeId(matchingExport);
-			const importedNodeIds =
+			const importingNodeIds =
 				this.graph.symbolIndex.get(importSymbol.name) || [];
 
-			for (const toId of importedNodeIds) {
+			for (const toId of importingNodeIds) {
 				if (fromId !== toId) {
+					// Edge direction: from = export (provider), to = import (consumer).
+					// In the call graph convention, "from" is the caller/dependent.
+					// The import consumer depends on the export provider, so:
+					// from = import node, to = export node.
 					this.graph.edges.push({
-						from: fromId,
-						to: toId,
+						from: toId, // importing symbol is the "caller" (depends on export)
+						to: fromId, // exported symbol is the "callee" (provider)
 						confidence: 1.0,
 						type: "import",
 					});
@@ -184,9 +241,13 @@ export class GraphBuilder {
 
 	private linkCallSites(): void {
 		for (const [filePath, metadata] of this.graph.files) {
-			for (const callSite of metadata.callSites) {
-				this.processCallSite(callSite, filePath);
-			}
+			this.processFileCallSites(filePath, metadata);
+		}
+	}
+
+	private processFileCallSites(filePath: string, metadata: FileMetadata): void {
+		for (const callSite of metadata.callSites) {
+			this.processCallSite(callSite, filePath);
 		}
 	}
 
@@ -234,7 +295,7 @@ export class GraphBuilder {
 		return (
 			symbol.file === filePath &&
 			callSite.line >= symbol.line &&
-			callSite.line <= symbol.line + 50
+			callSite.line <= symbol.endLine
 		);
 	}
 
@@ -253,18 +314,23 @@ export class GraphBuilder {
 		}
 
 		for (const [nodeId, node] of this.graph.nodes) {
-			node.fanOut = adjacencyList.get(nodeId)?.size || 0;
-			node.fanIn = reverseAdjacencyList.get(nodeId)?.size || 0;
-			node.callees = adjacencyList.get(nodeId) || new Set();
-			node.callers = reverseAdjacencyList.get(nodeId) || new Set();
+			// Update both the adjacency sets and the node's own sets
+			const callees = adjacencyList.get(nodeId);
+			const callers = reverseAdjacencyList.get(nodeId);
+			node.fanOut = callees?.size || 0;
+			node.fanIn = callers?.size || 0;
+			node.callees = callees || new Set();
+			node.callers = callers || new Set();
 		}
 
 		const pagerank = this.calculatePageRank(reverseAdjacencyList);
 
 		for (const [nodeId, node] of this.graph.nodes) {
 			const depth = this.calculateMaxDepth(nodeId, reverseAdjacencyList);
-			const rank = pagerank.get(nodeId) || 0;
-			node.riskScore = node.fanIn * 10 + depth * 5 + rank * 100;
+			const rank = Math.max(pagerank.get(nodeId) || 0, 0);
+			// Balance risk score components: scale PageRank up to be comparable to fanIn*10
+			const nodeCount = this.graph.nodes.size || 1;
+			node.riskScore = node.fanIn * 10 + depth * 5 + rank * nodeCount * 100;
 		}
 	}
 
@@ -275,9 +341,12 @@ export class GraphBuilder {
 		const iterations = 50;
 		const nodeCount = this.graph.nodes.size;
 
+		if (nodeCount === 0) return new Map();
+
 		const pagerank = new Map<string, number>();
+		const initialRank = 1 / nodeCount;
 		for (const [nodeId] of this.graph.nodes) {
-			pagerank.set(nodeId, 1 / nodeCount);
+			pagerank.set(nodeId, initialRank);
 		}
 
 		for (let i = 0; i < iterations; i++) {
@@ -289,7 +358,7 @@ export class GraphBuilder {
 
 				for (const inLink of inLinks) {
 					const outLinks = this.graph.nodes.get(inLink)?.fanOut || 1;
-					sum += (pagerank.get(inLink) || 0) / outLinks;
+					sum += (pagerank.get(inLink) || 0) / Math.max(outLinks, 1);
 				}
 
 				newPagerank.set(nodeId, (1 - damping) / nodeCount + damping * sum);
@@ -303,34 +372,46 @@ export class GraphBuilder {
 		return pagerank;
 	}
 
+	/**
+	 * Calculate maximum transitive depth using iterative stack (not recursive)
+	 * to avoid stack overflow on deep graphs and O(n²) memory from Set copying.
+	 */
 	private calculateMaxDepth(
 		nodeId: string,
 		reverseAdj: Map<string, Set<string>>,
-		visited: Set<string> = new Set(),
 	): number {
-		if (visited.has(nodeId)) return 0;
-		visited.add(nodeId);
+		// Memoization cache to reuse computed depths
+		const memo = new Map<string, number>();
+		const visited = new Set<string>();
 
-		const inLinks = reverseAdj.get(nodeId) || new Set();
-		if (inLinks.size === 0) return 0;
+		function dfs(id: string): number {
+			if (memo.has(id)) return memo.get(id)!;
 
-		let maxDepth = 0;
-		for (const inLink of inLinks) {
-			const depth = this.calculateMaxDepth(
-				inLink,
-				reverseAdj,
-				new Set(visited),
-			);
-			maxDepth = Math.max(maxDepth, depth + 1);
+			const inLinks = reverseAdj.get(id);
+			if (!inLinks || inLinks.size === 0) {
+				memo.set(id, 0);
+				return 0;
+			}
+
+			// Cycle detection: if currently visiting this node, depth contribution is 0
+			if (visited.has(id)) return 0;
+			visited.add(id);
+
+			let maxDepth = 0;
+			for (const inLink of inLinks) {
+				const depth = dfs(inLink);
+				maxDepth = Math.max(maxDepth, depth + 1);
+			}
+
+			visited.delete(id);
+			memo.set(id, maxDepth);
+			return maxDepth;
 		}
 
-		return maxDepth;
+		return dfs(nodeId);
 	}
 
 	private createNodeId(symbol: SymbolDefinition): string {
 		return `${symbol.file}::${symbol.name}`;
 	}
 }
-
-// Re-export types for convenience
-type ImportStatement = import("./types").ImportStatement;

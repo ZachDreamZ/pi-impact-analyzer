@@ -9,6 +9,8 @@ export interface SymbolDefinition {
 	file: string;
 	line: number;
 	column: number;
+	endLine: number;
+	endColumn: number;
 	startIndex: number;
 	endIndex: number;
 	isExported: boolean;
@@ -94,6 +96,8 @@ export interface ImpactOptions {
 	maxDepth?: number;
 	includeTests?: boolean;
 	format?: "table" | "json" | "markdown";
+	/** Root directory for resolving relative file paths (used in diff analysis) */
+	rootDir?: string;
 }
 
 /** File metadata for indexing */

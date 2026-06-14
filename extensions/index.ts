@@ -1,7 +1,10 @@
+import path from "path";
+import fs from "fs";
 import { TreeSitterParser } from "./parser";
 import { GraphBuilder } from "./graph-builder";
 import { ImpactAnalyzer } from "./impact-analyzer";
 import type { ImpactOptions, ImpactResult } from "./types";
+import type { CallGraph } from "./types";
 
 /**
  * pi-impact-analyzer
@@ -14,16 +17,20 @@ import type { ImpactOptions, ImpactResult } from "./types";
 let parser: TreeSitterParser | null = null;
 let graphBuilder: GraphBuilder | null = null;
 let impactAnalyzer: ImpactAnalyzer | null = null;
+let initialized = false;
 
 /**
- * Initialize the parser and graph builder.
+ * Initialize the parser, graph builder, and impact analyzer.
+ * Creates a lazy analyzer that will build its graph on first use if needed.
  */
 async function ensureInitialized(): Promise<void> {
-	if (!parser) {
-		parser = new TreeSitterParser();
-		await parser.initialize();
-		graphBuilder = new GraphBuilder(parser);
-	}
+	if (initialized) return;
+
+	parser = new TreeSitterParser();
+	await parser.initialize();
+	graphBuilder = new GraphBuilder(parser);
+	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
+	initialized = true;
 }
 
 /**
@@ -40,7 +47,7 @@ function formatAsTable(result: ImpactResult): string {
 	lines.push("  Direct dependents: " + result.summary.directDependents);
 	lines.push("  Transitive dependents: " + result.summary.transitiveDependents);
 	lines.push("  Test files: " + result.summary.testFiles);
-	lines.push("  Risk score: " + result.summary.riskScore.toFixed(2));
+	lines.push("  Risk score: " + (result.summary.riskScore || 0).toFixed(2));
 	lines.push("");
 
 	if (result.affected.length > 0) {
@@ -57,7 +64,7 @@ function formatAsTable(result: ImpactResult): string {
 					" depth:" +
 					item.depth +
 					" risk:" +
-					item.riskScore.toFixed(1),
+					(item.riskScore || 0).toFixed(1),
 			);
 		}
 		lines.push("");
@@ -91,7 +98,9 @@ function formatAsMarkdown(result: ImpactResult): string {
 		"| Transitive dependents | " + result.summary.transitiveDependents + " |",
 	);
 	lines.push("| Test files | " + result.summary.testFiles + " |");
-	lines.push("| Risk score | " + result.summary.riskScore.toFixed(2) + " |");
+	lines.push(
+		"| Risk score | " + (result.summary.riskScore || 0).toFixed(2) + " |",
+	);
 	lines.push("");
 
 	if (result.affected.length > 0) {
@@ -110,7 +119,7 @@ function formatAsMarkdown(result: ImpactResult): string {
 					" | " +
 					item.depth +
 					" | " +
-					item.riskScore.toFixed(1) +
+					(item.riskScore || 0).toFixed(1) +
 					" |",
 			);
 		}
@@ -129,27 +138,160 @@ function formatAsMarkdown(result: ImpactResult): string {
 }
 
 /**
- * Tool handler for impact_analyze.
+ * Scan a project directory recursively for .ts/.tsx/.js/.jsx files.
+ * Respects common ignore patterns: node_modules, dist, .git, etc.
  */
-export async function impactAnalyzeHandler(input: {
-	type: "symbol" | "file" | "diff";
-	target: string;
-	options?: ImpactOptions;
-}): Promise<ImpactResult | string> {
+function scanProjectFiles(
+	rootDir: string,
+): Array<{ path: string; content: string }> {
+	const IGNORE_DIRS = new Set([
+		"node_modules",
+		"dist",
+		".git",
+		".next",
+		"build",
+		"coverage",
+		".cache",
+		".nyc_output",
+	]);
+	const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+	const files: Array<{ path: string; content: string }> = [];
+
+	function walk(dir: string): void {
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(dir);
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const fullPath = path.join(dir, entry);
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(fullPath);
+			} catch {
+				continue;
+			}
+			if (stat.isDirectory()) {
+				if (!IGNORE_DIRS.has(entry)) {
+					walk(fullPath);
+				}
+			} else if (stat.isFile()) {
+				const ext = path.extname(entry).toLowerCase();
+				if (EXTENSIONS.has(ext)) {
+					try {
+						const content = fs.readFileSync(fullPath, "utf8");
+						files.push({ path: fullPath, content });
+					} catch {
+						// Skip unreadable files (binary, permissions, etc.)
+					}
+				}
+			}
+		}
+	}
+
+	walk(path.resolve(rootDir));
+	return files;
+}
+
+/**
+ * Scan a project directory and build the impact graph from all discovered files.
+ */
+export async function scanAndBuildGraph(rootDir?: string): Promise<CallGraph> {
 	await ensureInitialized();
 
-	if (!graphBuilder || !impactAnalyzer) {
+	const dir = rootDir || process.cwd();
+	const files = scanProjectFiles(dir);
+
+	if (files.length === 0) {
+		throw new Error(
+			`No source files found in ${dir}. Ensure the directory contains .ts, .tsx, .js, or .jsx files.`,
+		);
+	}
+
+	await buildGraph(files);
+
+	if (!graphBuilder) {
+		throw new Error("Failed to initialize graph builder");
+	}
+	return graphBuilder.getGraph();
+}
+
+/**
+ * Tool handler for impact_analyze.
+ * Dispatches to the correct analysis method based on input.type.
+ * Auto-indexes from CWD if the graph hasn't been built yet.
+ */
+export async function impactAnalyzeHandler(
+	input: {
+		type: "symbol" | "file" | "diff";
+		target: string;
+		options?: ImpactOptions;
+	},
+	_ctx?: any,
+): Promise<ImpactResult | string> {
+	await ensureInitialized();
+
+	if (!impactAnalyzer) {
 		throw new Error("Failed to initialize impact analyzer");
 	}
 
-	// Build graph if not already built
-	if (graphBuilder.getGraph().nodes.size === 0) {
-		console.log("[pi-impact-analyzer] Graph not built yet. Building...");
-		// In a real implementation, we'd scan the project files here
-		// For now, assume the graph has been built externally
+	if (!graphBuilder || graphBuilder.getGraph().nodes.size === 0) {
+		// Auto-index from current directory if no graph has been built yet
+		try {
+			await scanAndBuildGraph();
+		} catch {
+			return {
+				target: input.target,
+				type: input.type,
+				summary: {
+					totalAffected: 0,
+					directDependents: 0,
+					transitiveDependents: 0,
+					testFiles: 0,
+					riskScore: 0,
+				},
+				affected: [],
+				recommendations: [
+					"No files indexed and auto-scan failed. Call buildGraph() with project files manually.",
+				],
+			};
+		}
 	}
 
-	const result = impactAnalyzer.analyzeSymbol(input.target, input.options);
+	let result: ImpactResult;
+
+	switch (input.type) {
+		case "file":
+			result = impactAnalyzer.analyzeFile(input.target, input.options);
+			break;
+		case "symbol":
+			result = impactAnalyzer.analyzeSymbol(input.target, input.options);
+			break;
+		case "diff":
+			// If target is "staged" or "unstaged", run git diff automatically
+			if (input.target === "staged" || input.target === "unstaged") {
+				const gitDir = input.options?.rootDir || process.cwd();
+				const cmd =
+					input.target === "staged" ? "git diff --cached" : "git diff";
+				const { execSync } = require("child_process");
+				try {
+					const diffOutput = execSync(cmd, { cwd: gitDir, encoding: "utf8" });
+					result = impactAnalyzer.analyzeDiff(diffOutput, input.options);
+				} catch (e: any) {
+					throw new Error(
+						`Failed to run ${cmd} in ${gitDir}: ${e.message || e}`,
+					);
+				}
+			} else {
+				result = impactAnalyzer.analyzeDiff(input.target, input.options);
+			}
+			break;
+		default:
+			throw new Error(
+				`Unknown analysis type: ${(input as any).type}. Expected "symbol", "file", or "diff".`,
+			);
+	}
 
 	// Format output based on options
 	const format = input.options?.format || "json";
@@ -176,8 +318,90 @@ export async function buildGraph(
 
 	graphBuilder.build(files);
 
-	// Create analyzer with the built graph
+	// Create analyzer with the built graph (picks up the latest graph reference)
 	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
+}
+
+/**
+ * Recursively scan a directory for supported source files.
+ * Returns relative file paths matching .ts, .tsx, .js, .jsx, .mjs, .cjs extensions.
+ */
+export function scanProject(
+	rootDir: string,
+	options?: {
+		includeNodeModules?: boolean;
+		extensions?: string[];
+	},
+): string[] {
+	const fs = require("fs");
+	const path = require("path");
+
+	const {
+		includeNodeModules = false,
+		extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+	} = options || {};
+
+	const results: string[] = [];
+	const resolvedRoot = path.resolve(rootDir);
+
+	function walk(dir: string): void {
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(dir);
+		} catch {
+			return; // skip unreadable directories
+		}
+
+		for (const entry of entries) {
+			if (entry.startsWith(".")) continue; // skip hidden files/dirs
+
+			const fullPath = path.join(dir, entry);
+			const stat = fs.statSync(fullPath);
+
+			if (stat.isDirectory()) {
+				if (entry === "node_modules" && !includeNodeModules) continue;
+				if (entry === "dist" || entry === "build" || entry === ".git") continue;
+				walk(fullPath);
+			} else if (stat.isFile()) {
+				const ext = path.extname(entry);
+				if (extensions.includes(ext)) {
+					results.push(fullPath);
+				}
+			}
+		}
+	}
+
+	walk(resolvedRoot);
+	return results;
+}
+
+/**
+ * Scan a directory and build the impact graph from all found source files.
+ * Combines scanProject() and buildGraph() in one step.
+ */
+export async function buildGraphFromProject(
+	rootDir: string,
+	options?: {
+		includeNodeModules?: boolean;
+		extensions?: string[];
+	},
+): Promise<void> {
+	const fs = require("fs");
+
+	const filePaths = scanProject(rootDir, options);
+
+	if (filePaths.length === 0) {
+		throw new Error(
+			`No source files found in ${rootDir}. Make sure the directory contains .ts or .js files.`,
+		);
+	}
+
+	const files = filePaths.map((fp) => ({
+		path: fp,
+		content: fs.readFileSync(fp, "utf-8"),
+	}));
+
+	await buildGraph(files);
 }
 
 /**
@@ -219,9 +443,49 @@ export type {
 /**
  * Pi extension factory function.
  * This is the default export that Pi calls to initialize the extension.
+ * Async — matches the convention used by pi-smart-reader and other Pi extensions.
  */
-export default function piImpactAnalyzer(pi: any): void {
-	// Register the impact_analyze tool
-	pi.registerTool("impact_analyze", impactAnalyzeHandler);
-	console.log("[pi-impact-analyzer] Registered impact_analyze tool");
+export default async function piImpactAnalyzer(pi: any): Promise<void> {
+	// Register the impact_analyze tool using the object format
+	pi.registerTool({
+		name: "impact_analyze",
+		description:
+			"Analyze the impact of changing a symbol or file. Given a symbol name or file path, returns all affected code, risk scores, and recommendations.",
+		parameters: {
+			type: "object",
+			properties: {
+				type: {
+					type: "string",
+					enum: ["symbol", "file", "diff"],
+					description:
+						"Type of analysis: 'symbol' for a function/class name, 'file' for a file path, 'diff' for a git diff string or 'staged'/'unstaged' to run git diff automatically",
+				},
+				target: {
+					type: "string",
+					description: "The symbol name or file path to analyze the impact for",
+				},
+				options: {
+					type: "object",
+					properties: {
+						maxDepth: {
+							type: "number",
+							description:
+								"Maximum depth of transitive dependency traversal (default: 10)",
+						},
+						includeTests: {
+							type: "boolean",
+							description: "Include test files in results (default: true)",
+						},
+						format: {
+							type: "string",
+							enum: ["json", "table", "markdown"],
+							description: "Output format (default: json)",
+						},
+					},
+				},
+			},
+			required: ["type", "target"],
+		},
+		handler: impactAnalyzeHandler,
+	});
 }

@@ -1,11 +1,14 @@
 {
   "name": "pi-impact-analyzer",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "AST-based dependency tracing that answers: If I change this symbol, what else could break?",
-  "main": "extensions/index.ts",
+  "main": "dist/extensions/index.js",
+  "types": "dist/extensions/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc -w"
+    "dev": "tsc -w",
+    "test": "jest",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "pi",
@@ -19,16 +22,27 @@
   "author": "ZachDreamZ",
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./dist/extensions"
+    ]
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
-    "web-tree-sitter": "latest"
+    "web-tree-sitter": "^0.22.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=0.4.0",
+    "@earendil-works/pi-coding-agent": ">=0.4.0"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.0.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
     "typescript": "^5.0.0"
   }
 }

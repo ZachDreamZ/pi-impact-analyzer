@@ -314,7 +314,7 @@ export class ASTExtractor {
 	private extractExport(node: Node, filePath: string): ExportStatement | null {
 		const symbols: ExportStatement["symbols"] = [];
 
-		// export function foo() {}
+		// Handle default exports
 		const declaration = node.namedChildren[0];
 		if (declaration) {
 			const name = this.getNodeName(declaration);
@@ -326,8 +326,7 @@ export class ASTExtractor {
 			}
 		}
 
-		// export { foo, bar as baz }
-		// export default function foo() {}
+		// Handle named exports
 		for (const child of node.namedChildren) {
 			if (child.type === "export_specifier") {
 				const name = child.childByFieldName("name");

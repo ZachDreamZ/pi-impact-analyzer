@@ -174,7 +174,7 @@ export async function buildGraph(
 		throw new Error("Failed to initialize graph builder");
 	}
 
-	await graphBuilder.build(files);
+	graphBuilder.build(files);
 
 	// Create analyzer with the built graph
 	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());

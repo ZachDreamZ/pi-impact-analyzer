@@ -33,26 +33,18 @@ export class GraphBuilder {
 	/**
 	 * Build the graph from a list of files.
 	 */
-	public async build(
-		files: Array<{ path: string; content: string }>,
-	): Promise<CallGraph> {
+	public build(files: Array<{ path: string; content: string }>): CallGraph {
 		console.log(
 			`[pi-impact-analyzer] Building graph from ${files.length} files...`,
 		);
 		const startTime = Date.now();
 
-		// Phase 1: Extract all symbols, calls, imports, exports
 		for (const file of files) {
-			await this.indexFile(file.path, file.content);
+			this.indexFile(file.path, file.content);
 		}
 
-		// Phase 2: Resolve imports and link symbols
 		this.resolveAllImports();
-
-		// Phase 3: Link call sites to symbol definitions
 		this.linkCallSites();
-
-		// Phase 4: Calculate initial risk scores
 		this.calculateRiskScores();
 
 		const duration = Date.now() - startTime;
@@ -67,8 +59,8 @@ export class GraphBuilder {
 	/**
 	 * Add a single file to the graph.
 	 */
-	public async addFile(filePath: string, content: string): Promise<void> {
-		await this.indexFile(filePath, content);
+	public addFile(filePath: string, content: string): void {
+		this.indexFile(filePath, content);
 		this.resolveAllImports();
 		this.linkCallSites();
 		this.calculateRiskScores();
@@ -90,11 +82,10 @@ export class GraphBuilder {
 
 	// ============ Private Methods ============
 
-	private async indexFile(filePath: string, content: string): Promise<void> {
+	private indexFile(filePath: string, content: string): void {
 		const tree = this.parser.parse(content);
 		const rootNode = tree.rootNode;
 
-		// Extract metadata
 		const symbols = this.extractor.extractSymbols(rootNode, filePath);
 		const callSites = this.extractor.extractCallSites(
 			rootNode,
@@ -104,10 +95,9 @@ export class GraphBuilder {
 		const imports = this.extractor.extractImports(rootNode, filePath);
 		const exports = this.extractor.extractExports(rootNode, filePath);
 
-		// Store file metadata
 		const metadata: FileMetadata = {
 			path: filePath,
-			hash: "", // Could compute SHA-256 for incremental updates
+			hash: "",
 			lastModified: Date.now(),
 			symbols,
 			callSites,
@@ -118,7 +108,6 @@ export class GraphBuilder {
 		this.graph.files.set(filePath, metadata);
 		this.resolver.indexFile(metadata);
 
-		// Create nodes for each symbol
 		for (const symbol of symbols) {
 			const nodeId = this.createNodeId(symbol);
 			const node: GraphNode = {
@@ -133,7 +122,6 @@ export class GraphBuilder {
 
 			this.graph.nodes.set(nodeId, node);
 
-			// Index by name
 			const existing = this.graph.symbolIndex.get(symbol.name) || [];
 			existing.push(nodeId);
 			this.graph.symbolIndex.set(symbol.name, existing);
@@ -142,105 +130,111 @@ export class GraphBuilder {
 
 	private resolveAllImports(): void {
 		for (const [filePath, metadata] of this.graph.files) {
-			for (const importStmt of metadata.imports) {
-				const resolvedPath = this.resolver.resolveImportPath(
-					importStmt,
-					filePath,
-				);
-				if (!resolvedPath) continue;
+			this.processFileImports(filePath, metadata);
+		}
+	}
 
-				// Get exported symbols from the resolved file
-				const exportedSymbols = this.resolver.getExportedSymbols(resolvedPath);
+	private processFileImports(filePath: string, metadata: FileMetadata): void {
+		for (const importStmt of metadata.imports) {
+			const resolvedPath = this.resolver.resolveImportPath(
+				importStmt,
+				filePath,
+			);
+			if (!resolvedPath) continue;
 
-				// Create import edges
-				for (const importSymbol of importStmt.symbols) {
-					// Find matching exported symbol
-					const matchingExport = exportedSymbols.find(
-						(e) => e.name === importSymbol.name,
-					);
+			const exportedSymbols = this.resolver.getExportedSymbols(resolvedPath);
+			this.createImportEdges(importStmt, exportedSymbols);
+		}
+	}
 
-					if (matchingExport) {
-						const fromId = this.createNodeId(matchingExport);
+	private createImportEdges(
+		importStmt: ImportStatement,
+		exportedSymbols: SymbolDefinition[],
+	): void {
+		for (const importSymbol of importStmt.symbols) {
+			const matchingExport = this.findMatchingExport(exportedSymbols, importSymbol.name);
+			if (!matchingExport) continue;
 
-						// Import all symbols from this import statement
-						const importedNodeIds =
-							this.graph.symbolIndex.get(importSymbol.name) || [];
-						for (const toId of importedNodeIds) {
-							if (fromId !== toId) {
-								this.graph.edges.push({
-									from: fromId,
-									to: toId,
-									confidence: 1.0,
-									type: "import",
-								});
-							}
-						}
-					}
+			const fromId = this.createNodeId(matchingExport);
+			const importedNodeIds = this.graph.symbolIndex.get(importSymbol.name) || [];
+
+			for (const toId of importedNodeIds) {
+				if (fromId !== toId) {
+					this.graph.edges.push({
+						from: fromId,
+						to: toId,
+						confidence: 1.0,
+						type: "import",
+					});
 				}
 			}
 		}
+	}
+
+	private findMatchingExport(
+		exportedSymbols: SymbolDefinition[],
+		name: string,
+	): SymbolDefinition | undefined {
+		return exportedSymbols.find((e) => e.name === name);
 	}
 
 	private linkCallSites(): void {
 		for (const [filePath, metadata] of this.graph.files) {
 			for (const callSite of metadata.callSites) {
-				// Find the caller symbol
-				const callerNodeId = this.findCallerNode(callSite, filePath);
-				if (!callerNodeId) continue;
+				this.processCallSite(callSite, filePath);
+			}
+		}
+	}
 
-				// Resolve the callee
-				const resolvedSymbols = this.resolver.resolveSymbol(
-					callSite.calleeName,
-					filePath,
-				);
+	private processCallSite(callSite: CallSite, filePath: string): void {
+		const callerNodeId = this.findCallerNode(callSite, filePath);
+		if (!callerNodeId) return;
 
-				for (const { symbol: calleeSymbol, confidence } of resolvedSymbols) {
-					const calleeNodeId = this.createNodeId(calleeSymbol);
+		const resolvedSymbols = this.resolver.resolveSymbol(
+			callSite.calleeName,
+			filePath,
+		);
 
-					if (callerNodeId !== calleeNodeId) {
-						this.graph.edges.push({
-							from: callerNodeId,
-							to: calleeNodeId,
-							confidence,
-							type: "call",
-						});
-					}
-				}
+		for (const { symbol: calleeSymbol, confidence } of resolvedSymbols) {
+			const calleeNodeId = this.createNodeId(calleeSymbol);
+
+			if (callerNodeId !== calleeNodeId) {
+				this.graph.edges.push({
+					from: callerNodeId,
+					to: calleeNodeId,
+					confidence,
+					type: "call",
+				});
 			}
 		}
 	}
 
 	private findCallerNode(callSite: CallSite, filePath: string): string | null {
-		// Find the symbol that contains this call site
 		const metadata = this.graph.files.get(filePath);
 		if (!metadata) return null;
 
 		for (const symbol of metadata.symbols) {
-			if (
-				symbol.file === filePath &&
-				callSite.line >= symbol.line &&
-				callSite.line <= this.getEndLine(symbol, metadata)
-			) {
+			if (this.symbolContainsCallSite(symbol, callSite, filePath)) {
 				return this.createNodeId(symbol);
 			}
 		}
 
-		// If no containing symbol found, it's in module scope
-		// We could create a synthetic "module" node, but for now skip
 		return null;
 	}
 
-	private getEndLine(
+	private symbolContainsCallSite(
 		symbol: SymbolDefinition,
-		_metadata: FileMetadata,
-	): number {
-		// Approximate end line from the symbol's end index
-		// In a real implementation, we'd track this from the AST
-		return symbol.line + 50; // rough estimate
+		callSite: CallSite,
+		filePath: string,
+	): boolean {
+		return (
+			symbol.file === filePath &&
+			callSite.line >= symbol.line &&
+			callSite.line <= symbol.line + 50
+		);
 	}
 
 	private calculateRiskScores(): void {
-		// Build adjacency lists for traversal
 		const adjacencyList = new Map<string, Set<string>>();
 		const reverseAdjacencyList = new Map<string, Set<string>>();
 
@@ -254,24 +248,18 @@ export class GraphBuilder {
 			reverseAdjacencyList.get(edge.to)?.add(edge.from);
 		}
 
-		// Calculate fan-in and fan-out
 		for (const [nodeId, node] of this.graph.nodes) {
 			node.fanOut = adjacencyList.get(nodeId)?.size || 0;
 			node.fanIn = reverseAdjacencyList.get(nodeId)?.size || 0;
-
-			// Update callers and callees sets
 			node.callees = adjacencyList.get(nodeId) || new Set();
 			node.callers = reverseAdjacencyList.get(nodeId) || new Set();
 		}
 
-		// Calculate PageRank (simplified iterative version)
 		const pagerank = this.calculatePageRank(reverseAdjacencyList);
 
-		// Calculate final risk scores
 		for (const [nodeId, node] of this.graph.nodes) {
 			const depth = this.calculateMaxDepth(nodeId, reverseAdjacencyList);
 			const rank = pagerank.get(nodeId) || 0;
-
 			node.riskScore = node.fanIn * 10 + depth * 5 + rank * 100;
 		}
 	}
@@ -283,13 +271,11 @@ export class GraphBuilder {
 		const iterations = 50;
 		const nodeCount = this.graph.nodes.size;
 
-		// Initialize PageRank values
 		const pagerank = new Map<string, number>();
 		for (const [nodeId] of this.graph.nodes) {
 			pagerank.set(nodeId, 1 / nodeCount);
 		}
 
-		// Iterative calculation
 		for (let i = 0; i < iterations; i++) {
 			const newPagerank = new Map<string, number>();
 
@@ -305,7 +291,6 @@ export class GraphBuilder {
 				newPagerank.set(nodeId, (1 - damping) / nodeCount + damping * sum);
 			}
 
-			// Update pagerank
 			for (const [nodeId, value] of newPagerank) {
 				pagerank.set(nodeId, value);
 			}
@@ -342,3 +327,6 @@ export class GraphBuilder {
 		return `${symbol.file}::${symbol.name}`;
 	}
 }
+
+// Re-export types for convenience
+type ImportStatement = import("./types").ImportStatement;

@@ -1,6 +1,6 @@
 {
   "name": "pi-impact-analyzer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AST-based dependency tracing that answers: If I change this symbol, what else could break?",
   "main": "extensions/index.ts",
   "scripts": {
@@ -29,7 +29,6 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
   }
 }

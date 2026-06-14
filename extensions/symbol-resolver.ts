@@ -1,4 +1,3 @@
-import * as path from "path";
 import type { SymbolDefinition, ImportStatement, FileMetadata } from "./types";
 
 /**
@@ -9,6 +8,28 @@ export interface ResolverConfig {
 	paths?: Record<string, string[]>;
 	rootDir?: string;
 }
+
+/**
+ * Simple path utilities (no Node.js dependency)
+ */
+const PathUtils = {
+	dirname(filePath: string): string {
+		const lastSlash = Math.max(
+			filePath.lastIndexOf("/"),
+			filePath.lastIndexOf("\\"),
+		);
+		if (lastSlash === -1) return ".";
+		return filePath.substring(0, lastSlash);
+	},
+
+	join(...parts: string[]): string {
+		return parts.join("/").replace(/\/+/g, "/").replace(/\/$/, "") || ".";
+	},
+
+	sep(): string {
+		return "/";
+	},
+};
 
 /**
  * Resolves imports to actual file paths and symbols.
@@ -121,7 +142,6 @@ export class SymbolResolver {
 		if (!this.config.paths) return null;
 
 		for (const [alias, targets] of Object.entries(this.config.paths)) {
-			// Convert tsconfig pattern: "@utils/*" -> ["src/utils/*"]
 			const aliasPattern = alias.replace("*", "");
 			const sourceWithoutAlias = source.replace(aliasPattern, "");
 
@@ -129,7 +149,6 @@ export class SymbolResolver {
 				for (const target of targets) {
 					const targetPath = target.replace("*", sourceWithoutAlias);
 
-					// Try different extensions
 					for (const ext of [
 						"",
 						".ts",
@@ -139,7 +158,7 @@ export class SymbolResolver {
 						"/index.ts",
 						"/index.js",
 					]) {
-						const fullPath = path.join(
+						const fullPath = PathUtils.join(
 							this.config.rootDir || ".",
 							targetPath + ext,
 						);
@@ -155,10 +174,9 @@ export class SymbolResolver {
 	}
 
 	private resolveRelativePath(source: string, fromFile: string): string | null {
-		const fromDir = path.dirname(fromFile);
-		const resolved = path.join(fromDir, source);
+		const fromDir = PathUtils.dirname(fromFile);
+		const resolved = PathUtils.join(fromDir, source);
 
-		// Try different extensions
 		for (const ext of [
 			"",
 			".ts",
@@ -178,8 +196,7 @@ export class SymbolResolver {
 	}
 
 	private resolveAbsolutePath(source: string): string | null {
-		// Try from baseUrl
-		const basePath = path.join(this.config.baseUrl || ".", source);
+		const basePath = PathUtils.join(this.config.baseUrl || ".", source);
 
 		for (const ext of [
 			"",
@@ -203,34 +220,21 @@ export class SymbolResolver {
 		candidate: SymbolDefinition,
 		fromFile: string,
 	): number {
-		// 1. Same file - highest confidence
-		if (candidate.file === fromFile) {
-			return 1.0;
-		}
+		if (candidate.file === fromFile) return 1.0;
 
-		const candidateDir = path.dirname(candidate.file);
-		const fromDir = path.dirname(fromFile);
+		const candidateDir = PathUtils.dirname(candidate.file);
+		const fromDir = PathUtils.dirname(fromFile);
 
-		// 2. Same directory
-		if (candidateDir === fromDir) {
-			return 0.9;
-		}
+		if (candidateDir === fromDir) return 0.9;
 
-		// 3. Sibling directory
-		const candidateParent = path.dirname(candidateDir);
-		const fromParent = path.dirname(fromDir);
-		if (candidateParent === fromParent) {
-			return 0.7;
-		}
+		const candidateParent = PathUtils.dirname(candidateDir);
+		const fromParent = PathUtils.dirname(fromDir);
+		if (candidateParent === fromParent) return 0.7;
 
-		// 4. Same project (within 2 levels)
-		const candidateDepth = candidateDir.split(path.sep).length;
-		const fromDepth = fromDir.split(path.sep).length;
-		if (Math.abs(candidateDepth - fromDepth) <= 2) {
-			return 0.5;
-		}
+		const candidateDepth = candidateDir.split(PathUtils.sep()).length;
+		const fromDepth = fromDir.split(PathUtils.sep()).length;
+		if (Math.abs(candidateDepth - fromDepth) <= 2) return 0.5;
 
-		// 5. Global fallback
 		return 0.3;
 	}
 }

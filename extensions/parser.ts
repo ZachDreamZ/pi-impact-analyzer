@@ -5,6 +5,17 @@ export interface ParserConfig {
 	languagePath?: string;
 }
 
+/**
+ * Log function that can be overridden for different environments
+ */
+let logFn: (...args: unknown[]) => void = () => {
+	// Default no-op to avoid console dependency
+};
+
+export function setLogger(logger: (...args: unknown[]) => void): void {
+	logFn = logger;
+}
+
 export class TreeSitterParser {
 	private parser: Parser | null = null;
 	private language: any | null = null;
@@ -28,7 +39,7 @@ export class TreeSitterParser {
 			this.language = lang;
 			this.initialized = true;
 		} catch (error) {
-			console.error("[pi-impact-analyzer] Initialization failed:", error);
+			logFn("[pi-impact-analyzer] Initialization failed:", error);
 			throw new Error(`Failed to initialize tree-sitter: ${error}`);
 		}
 	}

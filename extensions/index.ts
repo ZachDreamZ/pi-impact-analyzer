@@ -124,6 +124,12 @@ function formatAsMarkdown(result: ImpactResult): string {
 			);
 		}
 		lines.push("");
+		lines.push(
+			"> **Tip**: Use `smart_read` to inspect affected symbols efficiently. Example:",
+		);
+		lines.push(
+			`> \`smart_read({ "path": "...", "options": { "mode": "symbol", "symbol": "..." } })\``,
+		);
 	}
 
 	if (result.recommendations.length > 0) {

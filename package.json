@@ -1,7 +1,7 @@
 {
   "name": "pi-impact-analyzer",
-  "version": "0.2.0",
-  "description": "AST-based dependency tracing that answers: If I change this symbol, what else could break?",
+  "version": "0.3.0",
+  "description": "AST-based dependency tracing that answers: If I change this symbol, what else could break? Passive mode with auto-indexing and caching.",
   "main": "dist/extensions/index.js",
   "types": "dist/extensions/index.d.ts",
   "scripts": {

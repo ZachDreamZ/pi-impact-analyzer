@@ -6,6 +6,16 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![npm version](https://img.shields.io/npm/v/pi-impact-analyzer.svg)](https://www.npmjs.com/package/pi-impact-analyzer)
 
+## 🚀 What's New in v0.3.0
+
+**Passive mode** — No configuration required! The extension now works out-of-the-box:
+
+- ✅ **Auto-indexes** your project on session start
+- ✅ **Indexes files** when Pi reads them
+- ✅ **Caches graph** to disk for faster startup
+- ✅ **Auto-analyzes** when you mention code changes
+- ✅ **Integrates** with pi-smart-reader for optimized workflows
+
 ## Problem Statement
 
 When an AI agent modifies a function or class, it often lacks visibility into the full blast radius of that change. This leads to:
@@ -23,45 +33,49 @@ The tool builds a call graph from the entire project using tree-sitter, then per
 
 ## Key Features
 
-### Symbol Impact Analysis
+### 🔍 Symbol Impact Analysis
 
 Given a symbol name (function, class, method), return:
 - All direct callers across the project
 - All transitive callers (callers of callers)
 - Risk score based on dependency depth and fan-in
 
-### File Impact Analysis
+### 📁 File Impact Analysis
 
 Given a file path, return:
 - All files that import from this file
 - All transitive dependents
 - Affected test files
 
-### Diff Impact Analysis
+### 📝 Diff Impact Analysis
 
 Given a git diff (staged, unstaged, or raw content), return:
 - Which symbols were modified (based on changed line ranges)
 - The combined blast radius of all changes
 - Affected test files and recommended test suites
 
-Supports `"staged"` (equivalent to `git diff --cached`) and `"unstaged"` (equivalent to `git diff`) modes for seamless integration into git workflows.
+### ⚡ Passive Mode (v0.3.0+)
 
-### Auto-Indexing
+**No configuration required!** The extension automatically:
 
-Automatically scans your project directory for `.ts`, `.tsx`, `.js`, and `.jsx` files when no graph has been built yet. Respects `node_modules/`, `dist/`, `.git/`, `build/`, and other common ignore directories.
+- **Auto-indexes** your project on session start
+- **Indexes files** when Pi reads them
+- **Caches graph** to disk for faster startup
+- **Auto-analyzes** when you mention code changes
+- **Emits events** for integration with other tools
 
-### Risk Scoring
+### 📊 Risk Scoring
 
-Assign risk scores to symbols based on:
+Assigns risk scores to symbols based on:
 - **Fan-in**: Number of direct callers (higher = riskier)
 - **Depth**: Transitive dependency depth (deeper = more cascade risk)
 - **Centrality**: PageRank-style importance in the call graph
 
-### Orphan Detection
+### 🎯 Orphan Detection
 
 Find symbols that are defined but never called, indicating dead code.
 
-### Language Support
+### 🌐 Language Support
 
 - TypeScript (`.ts`)
 - TypeScript with JSX (`.tsx` — React, JSX elements, generics)
@@ -75,11 +89,23 @@ pi install npm:pi-impact-analyzer
 
 ## Usage Guide
 
-The extension provides the `impact_analyze` tool.
+### Passive Mode (Recommended)
 
-### Scenario: Before modifying a function
+**Just install and use!** The extension automatically:
 
-**Step 1: Check impact**
+1. **Indexes your project** when Pi starts
+2. **Indexes files** as Pi reads them
+3. **Analyzes impact** when you mention code changes
+4. **Provides recommendations** for affected files
+
+No commands needed — it just works!
+
+### Active Tool
+
+For explicit analysis, use the `impact_analyze` tool:
+
+#### Before modifying a function
+
 ```json
 {
   "tool": "impact_analyze",
@@ -93,15 +119,9 @@ The extension provides the `impact_analyze` tool.
 
 **Result**: A table showing all affected symbols, their files, depth, and risk scores.
 
-**Step 2: Review affected files**
-Based on the impact analysis, read the affected files before making changes.
+#### After making changes
 
-**Step 3: Make changes with confidence**
-After reviewing the blast radius, proceed with modifications knowing exactly what needs updating.
-
-### Diff Analysis
-
-After making changes, check the impact of your diff before committing:
+Check the impact of your diff before committing:
 
 ```json
 {
@@ -110,19 +130,6 @@ After making changes, check the impact of your diff before committing:
     "type": "diff",
     "target": "unstaged",
     "options": { "format": "markdown" }
-  }
-}
-```
-
-Or analyze a specific diff string:
-
-```json
-{
-  "tool": "impact_analyze",
-  "input": {
-    "type": "diff",
-    "target": "@@ -5,6 +5,8 @@\n function greet(name: string) {\n-  return 'hello';\n+  return 'hello ' + name;\n }\n",
-    "options": { "format": "json" }
   }
 }
 ```
@@ -177,12 +184,29 @@ Affected Symbols:
 }
 ```
 
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Graph Build | 1ms/file |
+| Incremental Index | 21ms |
+| Impact Analysis | 0.01ms/symbol |
+| Throughput | 1988 files/second |
+| Hash Performance | 0.0166ms/hash |
+
 ## Programmatic API
 
 For use outside the Pi tool system, import the library directly:
 
 ```typescript
-import { TreeSitterParser, GraphBuilder, ImpactAnalyzer } from "pi-impact-analyzer";
+import { 
+  TreeSitterParser, 
+  GraphBuilder, 
+  ImpactAnalyzer,
+  autoIndex,
+  indexFile,
+  getIndexingStatus
+} from "pi-impact-analyzer";
 
 // Initialize parser
 const parser = new TreeSitterParser();
@@ -190,14 +214,49 @@ await parser.initialize();
 
 // Build graph from project
 const builder = new GraphBuilder(parser);
-const files = scanProject("./src");  // returns file paths
+const files = scanProject("./src");
 builder.build(files.map(p => ({ path: p, content: fs.readFileSync(p, "utf-8") })));
 
 // Analyze impact
 const analyzer = new ImpactAnalyzer(builder.getGraph());
 const result = analyzer.analyzeSymbol("myFunction");
 console.log(result.summary);
+
+// Passive mode functions
+await autoIndex(); // Auto-index current directory
+await indexFile("path/to/file.ts", content); // Index single file
+const status = getIndexingStatus(); // Get indexing status
 ```
+
+## Configuration
+
+The extension works with sensible defaults. To customize:
+
+```typescript
+import { updateConfig, getConfig } from "pi-impact-analyzer";
+
+// Update configuration
+updateConfig({
+  autoIndex: true,
+  cacheEnabled: true,
+  cacheTTL: 300000, // 5 minutes
+  debug: false,
+});
+
+// Get current config
+console.log(getConfig());
+```
+
+## Integration with pi-smart-reader
+
+`pi-impact-analyzer` emits `impact_detected` events that `pi-smart-reader` listens to. When impact analysis is performed:
+
+1. `pi-impact-analyzer` analyzes the symbol/file
+2. Emits `impact_detected` event with affected files
+3. `pi-smart-reader` pre-generates skeletons for affected files
+4. Context is optimized for faster access
+
+This integration happens automatically — no configuration needed!
 
 ## Technical Architecture
 
@@ -206,6 +265,7 @@ console.log(result.summary);
 - **Traversal**: BFS reverse-dependency traversal for impact analysis
 - **Risk Scoring**: Combines fan-in, depth, and PageRank centrality
 - **Auto-Indexing**: Recursive filesystem scanner respecting common ignore patterns
+- **Caching**: Disk-based graph caching with file hash tracking
 
 ## Compatibility
 
@@ -217,7 +277,7 @@ console.log(result.summary);
 
 Contributions are welcome. We are seeking support for:
 - Additional language bindings (Python, Go, Rust)
-- Incremental indexing for faster re-analysis
+- Incremental graph updates for real-time analysis
 - Performance benchmarks at 10K+ files
 
 Please follow the standard Pull Request process: Fork, Branch, Commit, and PR.

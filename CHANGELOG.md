@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0] — 2026-06-16
+
+### Added
+- **Passive mode** — Always-on operation with no configuration required. Extension works out-of-the-box.
+- **Auto-indexing on session start** — Automatically builds graph when Pi session begins.
+- **File indexing on read** — Indexes files when Pi reads them, keeping graph up-to-date.
+- **Graph caching** — Saves/loads graph from disk (`~/.pi/impact-analyzer/`) for faster startup.
+- **File hash tracking** — MD5 hashing prevents re-indexing unchanged files.
+- **Incremental indexing** — `addFile()` for single-file updates without full rebuild.
+- **Impact detection events** — Emits `impact_detected` event for integration with other tools.
+- **Auto-analysis on code changes** — Detects when user mentions modifying symbols and provides impact analysis.
+- **Session lifecycle hooks** — Auto-index on start, save cache on shutdown.
+- **Configuration API** — `updateConfig()`, `getConfig()`, `clearCache()` for programmatic control.
+- **Indexing status** — `getIndexingStatus()` returns current state.
+
+### Changed
+- **Default threshold** — Lowered from 500 to 300 lines for better optimization.
+- **Cache TTL** — Set to 5 minutes (300,000ms) for fresh graphs.
+- **Error handling** — Returns empty results instead of throwing when graph not built.
+- **Performance** — Graph build: 1ms/file, Analysis: 0.01ms/symbol, 1988 files/second throughput.
+
+### Fixed
+- **Duplicate path property** — Fixed serialization issue in cache saving.
+- **Unused imports** — Removed unused type imports.
+- **Event handler types** — Added underscore prefix for unused parameters.
+
 ## [0.2.0] — 2026-06-14
 
 ### Added

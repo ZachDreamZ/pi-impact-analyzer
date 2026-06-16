@@ -1,5 +1,7 @@
 import path from "path";
 import fs from "fs";
+import os from "os";
+import crypto from "crypto";
 import { TreeSitterParser } from "./parser";
 import { GraphBuilder } from "./graph-builder";
 import { ImpactAnalyzer } from "./impact-analyzer";
@@ -11,31 +13,507 @@ import type { CallGraph } from "./types";
  *
  * AST-based dependency tracing that answers:
  * "If I change this symbol, what else could break?"
+ *
+ * v0.3.0 - Passive mode with auto-indexing and caching
  */
 
-// Singleton instances
+// ============ Configuration ============
+
+const DEFAULT_CONFIG = {
+	/** Auto-index project on session start */
+	autoIndex: true,
+	/** Cache graph to disk for faster startup */
+	cacheEnabled: true,
+	/** Cache TTL in milliseconds (5 minutes) */
+	cacheTTL: 300_000,
+	/** Directories to ignore when scanning */
+	ignoreDirs: new Set([
+		"node_modules",
+		"dist",
+		".git",
+		".next",
+		"build",
+		"coverage",
+		".cache",
+		".nyc_output",
+	]),
+	/** File extensions to index */
+	extensions: new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]),
+	/** Enable debug logging */
+	debug: false,
+};
+
+type Config = typeof DEFAULT_CONFIG;
+
+// ============ Singleton State ============
+
 let parser: TreeSitterParser | null = null;
 let graphBuilder: GraphBuilder | null = null;
 let impactAnalyzer: ImpactAnalyzer | null = null;
 let initialized = false;
+let config: Config = { ...DEFAULT_CONFIG };
+let indexingInProgress = false;
+let lastIndexTime = 0;
 
-/**
- * Initialize the parser, graph builder, and impact analyzer.
- * Creates a lazy analyzer that will build its graph on first use if needed.
- */
+// File hash cache for incremental updates
+const fileHashes = new Map<string, string>();
+
+// ============ Cache Paths ============
+
+const CACHE_DIR = path.join(os.homedir(), ".pi", "impact-analyzer");
+const GRAPH_CACHE_PATH = path.join(CACHE_DIR, "graph.json");
+const META_CACHE_PATH = path.join(CACHE_DIR, "meta.json");
+
+// ============ Logging ============
+
+function log(...args: unknown[]): void {
+	if (config.debug) {
+		console.log("[pi-impact-analyzer]", ...args);
+	}
+}
+
+// ============ Cache Management ============
+
+interface CacheMeta {
+	hash: string;
+	fileCount: number;
+	timestamp: number;
+	rootDir: string;
+}
+
+function ensureCacheDir(): void {
+	if (!fs.existsSync(CACHE_DIR)) {
+		fs.mkdirSync(CACHE_DIR, { recursive: true });
+	}
+}
+
+function calculateGraphHash(files: Array<{ path: string }>): string {
+	const content = files
+		.map((f) => f.path)
+		.sort()
+		.join("\n");
+	return crypto.createHash("md5").update(content).digest("hex");
+}
+
+function saveCache(graph: CallGraph, rootDir: string): void {
+	if (!config.cacheEnabled) return;
+
+	try {
+		ensureCacheDir();
+
+		// Serialize graph
+		const graphData = {
+			nodes: Array.from(graph.nodes.entries()).map(([id, node]) => ({
+				id,
+				symbol: node.symbol,
+				callers: Array.from(node.callers),
+				callees: Array.from(node.callees),
+				fanIn: node.fanIn,
+				fanOut: node.fanOut,
+				riskScore: node.riskScore,
+			})),
+			edges: graph.edges,
+			files: Array.from(graph.files.entries()).map(([filePath, meta]) => {
+				const { path: _path, ...rest } = meta as any;
+				return { path: filePath, ...rest };
+			}),
+			symbolIndex: Array.from(graph.symbolIndex.entries()),
+		};
+
+		fs.writeFileSync(GRAPH_CACHE_PATH, JSON.stringify(graphData, null, 2));
+
+		// Save metadata
+		const meta: CacheMeta = {
+			hash: calculateGraphHash(
+				Array.from(graph.files.keys()).map((p) => ({ path: p })),
+			),
+			fileCount: graph.files.size,
+			timestamp: Date.now(),
+			rootDir,
+		};
+		fs.writeFileSync(META_CACHE_PATH, JSON.stringify(meta, null, 2));
+
+		log("Graph cached successfully");
+	} catch (err) {
+		log("Failed to cache graph:", err);
+	}
+}
+
+function loadCache(): CallGraph | null {
+	if (!config.cacheEnabled) return null;
+
+	try {
+		if (!fs.existsSync(GRAPH_CACHE_PATH) || !fs.existsSync(META_CACHE_PATH)) {
+			return null;
+		}
+
+		const meta: CacheMeta = JSON.parse(
+			fs.readFileSync(META_CACHE_PATH, "utf8"),
+		);
+
+		// Check TTL
+		if (Date.now() - meta.timestamp > config.cacheTTL) {
+			log("Cache expired, rebuilding");
+			return null;
+		}
+
+		const graphData = JSON.parse(fs.readFileSync(GRAPH_CACHE_PATH, "utf8"));
+
+		// Reconstruct graph
+		const graph: CallGraph = {
+			nodes: new Map(),
+			edges: graphData.edges,
+			files: new Map(),
+			symbolIndex: new Map(),
+		};
+
+		for (const nodeData of graphData.nodes) {
+			graph.nodes.set(nodeData.id, {
+				id: nodeData.id,
+				symbol: nodeData.symbol,
+				callers: new Set(nodeData.callers),
+				callees: new Set(nodeData.callees),
+				fanIn: nodeData.fanIn,
+				fanOut: nodeData.fanOut,
+				riskScore: nodeData.riskScore,
+			});
+		}
+
+		for (const fileData of graphData.files) {
+			const { path: filePath, ...meta } = fileData;
+			graph.files.set(filePath, meta as any);
+		}
+
+		for (const [name, nodeIds] of graphData.symbolIndex) {
+			graph.symbolIndex.set(name, nodeIds);
+		}
+
+		log("Graph loaded from cache");
+		return graph;
+	} catch (err) {
+		log("Failed to load cache:", err);
+		return null;
+	}
+}
+
+// ============ Initialization ============
+
 async function ensureInitialized(): Promise<void> {
 	if (initialized) return;
 
 	parser = new TreeSitterParser();
 	await parser.initialize();
 	graphBuilder = new GraphBuilder(parser);
+
+	// Try to load cached graph
+	const cachedGraph = loadCache();
+	if (cachedGraph && cachedGraph.nodes.size > 0) {
+		// Restore graph state
+		for (const [id, node] of cachedGraph.nodes) {
+			graphBuilder.getGraph().nodes.set(id, node);
+		}
+		graphBuilder.getGraph().edges = cachedGraph.edges;
+		for (const [path, meta] of cachedGraph.files) {
+			graphBuilder.getGraph().files.set(path, meta);
+		}
+		for (const [name, nodeIds] of cachedGraph.symbolIndex) {
+			graphBuilder.getGraph().symbolIndex.set(name, nodeIds);
+		}
+		log("Restored graph from cache");
+	}
+
 	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
 	initialized = true;
 }
 
+// ============ File Operations ============
+
+function calculateFileHash(content: string): string {
+	return crypto.createHash("md5").update(content).digest("hex");
+}
+
+function isFileChanged(filePath: string, content: string): boolean {
+	const newHash = calculateFileHash(content);
+	const oldHash = fileHashes.get(filePath);
+
+	if (oldHash === newHash) {
+		return false;
+	}
+
+	fileHashes.set(filePath, newHash);
+	return true;
+}
+
+function scanProjectFiles(
+	rootDir: string,
+): Array<{ path: string; content: string }> {
+	const files: Array<{ path: string; content: string }> = [];
+
+	function walk(dir: string): void {
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(dir);
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const fullPath = path.join(dir, entry);
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(fullPath);
+			} catch {
+				continue;
+			}
+			if (stat.isDirectory()) {
+				if (!config.ignoreDirs.has(entry)) {
+					walk(fullPath);
+				}
+			} else if (stat.isFile()) {
+				const ext = path.extname(entry).toLowerCase();
+				if (config.extensions.has(ext)) {
+					try {
+						const content = fs.readFileSync(fullPath, "utf8");
+						files.push({ path: fullPath, content });
+					} catch {
+						// Skip unreadable files
+					}
+				}
+			}
+		}
+	}
+
+	walk(path.resolve(rootDir));
+	return files;
+}
+
+// ============ Core Functions ============
+
+export async function scanAndBuildGraph(rootDir?: string): Promise<CallGraph> {
+	await ensureInitialized();
+
+	if (indexingInProgress) {
+		log("Indexing already in progress, skipping");
+		return graphBuilder!.getGraph();
+	}
+
+	indexingInProgress = true;
+	const startTime = Date.now();
+
+	try {
+		const dir = rootDir || process.cwd();
+		const files = scanProjectFiles(dir);
+
+		if (files.length === 0) {
+			log(`No source files found in ${dir}`);
+			return graphBuilder!.getGraph();
+		}
+
+		await buildGraph(files);
+		lastIndexTime = Date.now();
+
+		// Cache the graph
+		saveCache(graphBuilder!.getGraph(), dir);
+
+		const duration = Date.now() - startTime;
+		log(`Graph built in ${duration}ms (${files.length} files)`);
+
+		return graphBuilder!.getGraph();
+	} finally {
+		indexingInProgress = false;
+	}
+}
+
+export async function buildGraph(
+	files: Array<{ path: string; content: string }>,
+): Promise<void> {
+	await ensureInitialized();
+
+	if (!graphBuilder) {
+		throw new Error("Failed to initialize graph builder");
+	}
+
+	graphBuilder.build(files);
+	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
+}
+
+export async function indexFile(
+	filePath: string,
+	content: string,
+): Promise<void> {
+	await ensureInitialized();
+
+	if (!graphBuilder) {
+		throw new Error("Failed to initialize graph builder");
+	}
+
+	// Check if file actually changed
+	if (!isFileChanged(filePath, content)) {
+		log(`File unchanged, skipping: ${filePath}`);
+		return;
+	}
+
+	// Add file incrementally
+	graphBuilder.addFile(filePath, content);
+	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
+
+	log(`Indexed file: ${filePath}`);
+}
+
+export function impactAnalyzeHandler(
+	input: {
+		type: "symbol" | "file" | "diff";
+		target: string;
+		options?: ImpactOptions;
+	},
+	_ctx?: any,
+): ImpactResult | string {
+	if (!impactAnalyzer) {
+		// Return empty result instead of throwing
+		return {
+			target: input.target,
+			type: input.type,
+			summary: {
+				totalAffected: 0,
+				directDependents: 0,
+				transitiveDependents: 0,
+				testFiles: 0,
+				riskScore: 0,
+			},
+			affected: [],
+			recommendations: [
+				"Graph not built yet. Auto-indexing will start on session start.",
+			],
+		};
+	}
+
+	let result: ImpactResult;
+
+	switch (input.type) {
+		case "file":
+			result = impactAnalyzer.analyzeFile(input.target, input.options);
+			break;
+		case "symbol":
+			result = impactAnalyzer.analyzeSymbol(input.target, input.options);
+			break;
+		case "diff":
+			if (input.target === "staged" || input.target === "unstaged") {
+				const gitDir = input.options?.rootDir || process.cwd();
+				const cmd =
+					input.target === "staged" ? "git diff --cached" : "git diff";
+				const { execSync } = require("child_process");
+				try {
+					const diffOutput = execSync(cmd, { cwd: gitDir, encoding: "utf8" });
+					result = impactAnalyzer.analyzeDiff(diffOutput, input.options);
+				} catch (e: any) {
+					throw new Error(
+						`Failed to run ${cmd} in ${gitDir}: ${e.message || e}`,
+					);
+				}
+			} else {
+				result = impactAnalyzer.analyzeDiff(input.target, input.options);
+			}
+			break;
+		default:
+			throw new Error(
+				`Unknown analysis type: ${(input as any).type}. Expected "symbol", "file", or "diff".`,
+			);
+	}
+
+	const format = input.options?.format || "json";
+	if (format === "table") {
+		return formatAsTable(result);
+	} else if (format === "markdown") {
+		return formatAsMarkdown(result);
+	}
+
+	return result;
+}
+
+// ============ Passive Mode Functions ============
+
 /**
- * Format impact result as a table string.
+ * Auto-index the project directory.
+ * Called automatically on session start if autoIndex is enabled.
  */
+export async function autoIndex(rootDir?: string): Promise<void> {
+	if (!config.autoIndex) return;
+	if (indexingInProgress) return;
+
+	// Check if we need to reindex
+	if (lastIndexTime > 0 && Date.now() - lastIndexTime < config.cacheTTL) {
+		log("Graph still fresh, skipping auto-index");
+		return;
+	}
+
+	await scanAndBuildGraph(rootDir);
+}
+
+/**
+ * Check if a file is a source file that should be indexed.
+ */
+export function isSourceFile(filePath: string): boolean {
+	const ext = path.extname(filePath).toLowerCase();
+	return config.extensions.has(ext);
+}
+
+/**
+ * Get indexing status.
+ */
+export function getIndexingStatus(): {
+	initialized: boolean;
+	indexing: boolean;
+	nodeCount: number;
+	fileCount: number;
+	lastIndexTime: number;
+} {
+	return {
+		initialized,
+		indexing: indexingInProgress,
+		nodeCount: graphBuilder?.getGraph().nodes.size || 0,
+		fileCount: graphBuilder?.getGraph().files.size || 0,
+		lastIndexTime,
+	};
+}
+
+/**
+ * Invalidate cache for a specific file.
+ */
+export function invalidateFile(filePath: string): void {
+	fileHashes.delete(filePath);
+	log(`Invalidated cache for: ${filePath}`);
+}
+
+/**
+ * Clear all caches.
+ */
+export function clearCache(): void {
+	fileHashes.clear();
+	if (fs.existsSync(GRAPH_CACHE_PATH)) {
+		fs.unlinkSync(GRAPH_CACHE_PATH);
+	}
+	if (fs.existsSync(META_CACHE_PATH)) {
+		fs.unlinkSync(META_CACHE_PATH);
+	}
+	log("Cache cleared");
+}
+
+/**
+ * Update configuration.
+ */
+export function updateConfig(newConfig: Partial<Config>): void {
+	config = { ...config, ...newConfig };
+	log("Config updated:", config);
+}
+
+/**
+ * Get current configuration.
+ */
+export function getConfig(): Readonly<Config> {
+	return config;
+}
+
+// ============ Formatting ============
+
 function formatAsTable(result: ImpactResult): string {
 	const lines: string[] = [];
 
@@ -80,9 +558,6 @@ function formatAsTable(result: ImpactResult): string {
 	return lines.join("\n");
 }
 
-/**
- * Format impact result as markdown.
- */
 function formatAsMarkdown(result: ImpactResult): string {
 	const lines: string[] = [];
 
@@ -143,195 +618,8 @@ function formatAsMarkdown(result: ImpactResult): string {
 	return lines.join("\n");
 }
 
-/**
- * Scan a project directory recursively for .ts/.tsx/.js/.jsx files.
- * Respects common ignore patterns: node_modules, dist, .git, etc.
- */
-function scanProjectFiles(
-	rootDir: string,
-): Array<{ path: string; content: string }> {
-	const IGNORE_DIRS = new Set([
-		"node_modules",
-		"dist",
-		".git",
-		".next",
-		"build",
-		"coverage",
-		".cache",
-		".nyc_output",
-	]);
-	const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
-	const files: Array<{ path: string; content: string }> = [];
+// ============ Legacy Exports ============
 
-	function walk(dir: string): void {
-		let entries: string[];
-		try {
-			entries = fs.readdirSync(dir);
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			const fullPath = path.join(dir, entry);
-			let stat: fs.Stats;
-			try {
-				stat = fs.statSync(fullPath);
-			} catch {
-				continue;
-			}
-			if (stat.isDirectory()) {
-				if (!IGNORE_DIRS.has(entry)) {
-					walk(fullPath);
-				}
-			} else if (stat.isFile()) {
-				const ext = path.extname(entry).toLowerCase();
-				if (EXTENSIONS.has(ext)) {
-					try {
-						const content = fs.readFileSync(fullPath, "utf8");
-						files.push({ path: fullPath, content });
-					} catch {
-						// Skip unreadable files (binary, permissions, etc.)
-					}
-				}
-			}
-		}
-	}
-
-	walk(path.resolve(rootDir));
-	return files;
-}
-
-/**
- * Scan a project directory and build the impact graph from all discovered files.
- */
-export async function scanAndBuildGraph(rootDir?: string): Promise<CallGraph> {
-	await ensureInitialized();
-
-	const dir = rootDir || process.cwd();
-	const files = scanProjectFiles(dir);
-
-	if (files.length === 0) {
-		throw new Error(
-			`No source files found in ${dir}. Ensure the directory contains .ts, .tsx, .js, or .jsx files.`,
-		);
-	}
-
-	await buildGraph(files);
-
-	if (!graphBuilder) {
-		throw new Error("Failed to initialize graph builder");
-	}
-	return graphBuilder.getGraph();
-}
-
-/**
- * Tool handler for impact_analyze.
- * Dispatches to the correct analysis method based on input.type.
- * Auto-indexes from CWD if the graph hasn't been built yet.
- */
-export async function impactAnalyzeHandler(
-	input: {
-		type: "symbol" | "file" | "diff";
-		target: string;
-		options?: ImpactOptions;
-	},
-	_ctx?: any,
-): Promise<ImpactResult | string> {
-	await ensureInitialized();
-
-	if (!impactAnalyzer) {
-		throw new Error("Failed to initialize impact analyzer");
-	}
-
-	if (!graphBuilder || graphBuilder.getGraph().nodes.size === 0) {
-		// Auto-index from current directory if no graph has been built yet
-		try {
-			await scanAndBuildGraph();
-		} catch {
-			return {
-				target: input.target,
-				type: input.type,
-				summary: {
-					totalAffected: 0,
-					directDependents: 0,
-					transitiveDependents: 0,
-					testFiles: 0,
-					riskScore: 0,
-				},
-				affected: [],
-				recommendations: [
-					"No files indexed and auto-scan failed. Call buildGraph() with project files manually.",
-				],
-			};
-		}
-	}
-
-	let result: ImpactResult;
-
-	switch (input.type) {
-		case "file":
-			result = impactAnalyzer.analyzeFile(input.target, input.options);
-			break;
-		case "symbol":
-			result = impactAnalyzer.analyzeSymbol(input.target, input.options);
-			break;
-		case "diff":
-			// If target is "staged" or "unstaged", run git diff automatically
-			if (input.target === "staged" || input.target === "unstaged") {
-				const gitDir = input.options?.rootDir || process.cwd();
-				const cmd =
-					input.target === "staged" ? "git diff --cached" : "git diff";
-				const { execSync } = require("child_process");
-				try {
-					const diffOutput = execSync(cmd, { cwd: gitDir, encoding: "utf8" });
-					result = impactAnalyzer.analyzeDiff(diffOutput, input.options);
-				} catch (e: any) {
-					throw new Error(
-						`Failed to run ${cmd} in ${gitDir}: ${e.message || e}`,
-					);
-				}
-			} else {
-				result = impactAnalyzer.analyzeDiff(input.target, input.options);
-			}
-			break;
-		default:
-			throw new Error(
-				`Unknown analysis type: ${(input as any).type}. Expected "symbol", "file", or "diff".`,
-			);
-	}
-
-	// Format output based on options
-	const format = input.options?.format || "json";
-	if (format === "table") {
-		return formatAsTable(result);
-	} else if (format === "markdown") {
-		return formatAsMarkdown(result);
-	}
-
-	return result;
-}
-
-/**
- * Build the impact graph from files.
- */
-export async function buildGraph(
-	files: Array<{ path: string; content: string }>,
-): Promise<void> {
-	await ensureInitialized();
-
-	if (!graphBuilder) {
-		throw new Error("Failed to initialize graph builder");
-	}
-
-	graphBuilder.build(files);
-
-	// Create analyzer with the built graph (picks up the latest graph reference)
-	impactAnalyzer = new ImpactAnalyzer(graphBuilder.getGraph());
-}
-
-/**
- * Recursively scan a directory for supported source files.
- * Returns relative file paths matching .ts, .tsx, .js, .jsx, .mjs, .cjs extensions.
- */
 export function scanProject(
 	rootDir: string,
 	options?: {
@@ -339,9 +627,6 @@ export function scanProject(
 		extensions?: string[];
 	},
 ): string[] {
-	const fs = require("fs");
-	const path = require("path");
-
 	const {
 		includeNodeModules = false,
 		extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
@@ -355,11 +640,11 @@ export function scanProject(
 		try {
 			entries = fs.readdirSync(dir);
 		} catch {
-			return; // skip unreadable directories
+			return;
 		}
 
 		for (const entry of entries) {
-			if (entry.startsWith(".")) continue; // skip hidden files/dirs
+			if (entry.startsWith(".")) continue;
 
 			const fullPath = path.join(dir, entry);
 			const stat = fs.statSync(fullPath);
@@ -381,10 +666,6 @@ export function scanProject(
 	return results;
 }
 
-/**
- * Scan a directory and build the impact graph from all found source files.
- * Combines scanProject() and buildGraph() in one step.
- */
 export async function buildGraphFromProject(
 	rootDir: string,
 	options?: {
@@ -392,8 +673,6 @@ export async function buildGraphFromProject(
 		extensions?: string[];
 	},
 ): Promise<void> {
-	const fs = require("fs");
-
 	const filePaths = scanProject(rootDir, options);
 
 	if (filePaths.length === 0) {
@@ -410,9 +689,6 @@ export async function buildGraphFromProject(
 	await buildGraph(files);
 }
 
-/**
- * Get the riskiest symbols in the codebase.
- */
 export function getRiskiestSymbols(topN: number = 10) {
 	if (!impactAnalyzer) {
 		throw new Error("Graph not built yet. Call buildGraph() first.");
@@ -420,9 +696,6 @@ export function getRiskiestSymbols(topN: number = 10) {
 	return impactAnalyzer.findRiskiestSymbols(topN);
 }
 
-/**
- * Get orphan symbols (defined but never called).
- */
 export function getOrphans() {
 	if (!impactAnalyzer) {
 		throw new Error("Graph not built yet. Call buildGraph() first.");
@@ -430,7 +703,8 @@ export function getOrphans() {
 	return impactAnalyzer.findOrphans();
 }
 
-// Export types and classes for programmatic use
+// ============ Type Exports ============
+
 export { TreeSitterParser } from "./parser";
 export { GraphBuilder } from "./graph-builder";
 export { ImpactAnalyzer } from "./impact-analyzer";
@@ -446,13 +720,16 @@ export type {
 	GraphNode,
 } from "./types";
 
+// ============ Pi Extension Factory ============
+
 /**
  * Pi extension factory function.
  * This is the default export that Pi calls to initialize the extension.
- * Async — matches the convention used by pi-smart-reader and other Pi extensions.
+ *
+ * v0.3.0 - Passive mode with auto-indexing
  */
 export default async function piImpactAnalyzer(pi: any): Promise<void> {
-	// Register the impact_analyze tool using the object format
+	// Register the impact_analyze tool
 	pi.registerTool({
 		name: "impact_analyze",
 		description:
@@ -494,4 +771,79 @@ export default async function piImpactAnalyzer(pi: any): Promise<void> {
 		},
 		handler: impactAnalyzeHandler,
 	});
+
+	// ============ Passive Mode Event Handlers ============
+
+	// Auto-index on session start
+	pi.on("session_start", async (ctx: any) => {
+		log("Session started, auto-indexing...");
+		try {
+			await autoIndex(ctx?.cwd);
+			log("Auto-index complete");
+		} catch (err) {
+			log("Auto-index failed:", err);
+		}
+	});
+
+	// Index files when Pi reads them
+	pi.on("tool_result", async (event: any, _ctx: any) => {
+		if (event?.toolName === "read" && event?.path) {
+			const filePath = event.path;
+			if (isSourceFile(filePath) && event?.content) {
+				try {
+					await indexFile(filePath, event.content);
+				} catch (err) {
+					log("Failed to index file:", filePath, err);
+				}
+			}
+		}
+	});
+
+	// Auto-analyze when user mentions code changes
+	pi.on("message_end", async (event: any, _ctx: any) => {
+		const message = event?.message?.content;
+		if (!message || typeof message !== "string") return;
+
+		// Simple heuristic: detect code change mentions
+		const changePatterns = [
+			/modify\s+(\w+)/i,
+			/change\s+(\w+)/i,
+			/update\s+(\w+)/i,
+			/refactor\s+(\w+)/i,
+			/delete\s+(\w+)/i,
+		];
+
+		for (const pattern of changePatterns) {
+			const match = message.match(pattern);
+			if (match && match[1]) {
+				const symbolName = match[1];
+				try {
+					const impact = impactAnalyzer?.analyzeSymbol(symbolName);
+					if (impact && impact.summary.totalAffected > 0) {
+						log(
+							`Impact detected: ${symbolName} affects ${impact.summary.totalAffected} symbols`,
+						);
+						// Emit impact event for other tools (like smart-reader)
+						pi.emit("impact_detected", {
+							symbol: symbolName,
+							impact,
+						});
+					}
+				} catch {
+					// Ignore analysis errors
+				}
+				break;
+			}
+		}
+	});
+
+	// Save graph on session end
+	pi.on("session_shutdown", async () => {
+		log("Session ending, saving graph...");
+		if (graphBuilder) {
+			saveCache(graphBuilder.getGraph(), process.cwd());
+		}
+	});
+
+	log("Extension loaded (passive mode)");
 }
